@@ -44,6 +44,15 @@ Output, per run:
 COMMIT NOTE: commit once run successfully end-to-end on a real
 synthetic_defence_test triplet and both audio outputs sound correct -
 not before.
+
+ADDITION (2026-09-02): added --onnx flag. When set, both file mode and
+mic mode call src/pipeline.py's ONNX chunked path (enhance_audio_file_onnx
+/ enhance_onnx_stage) instead of the torch DeepFilterNet3 path - this is
+the path with no Rust/torch dependency, meant to run on the Pi. --chunk-
+seconds controls the buffer size each ONNX call processes independently
+(GRU state resets at each chunk boundary - see src/df_onnx_dsp.py's
+enhance_chunked ADDITION note). --onnx-dir points at the folder holding
+enc.onnx/erb_dec.onnx/df_dec.onnx (default models/onnx_export).
 """
 
 import argparse
@@ -64,7 +73,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.pipeline import enhance_audio_file, enhance_dtln_stage
+from src.pipeline import enhance_audio_file, enhance_dtln_stage, enhance_audio_file_onnx, enhance_onnx_stage
 from src.audio.io import load_audio_file
 from src.audio.framing import frame_signal
 from src.model.nlms import apply_nlms
@@ -103,12 +112,6 @@ def count_frames(signal, config_path):
 
 
 def build_before_after_audio(before_signal, after_signal, sample_rate, gap_seconds=GAP_SECONDS):
-    """
-    Concatenates before_signal, a silent gap, then after_signal into one
-    array, normalizing both halves to the SAME peak level first so a judge
-    doesn't mistake a simple volume difference for enhancement quality -
-    only the actual noise/clarity difference should be audible.
-    """
     before_signal = np.asarray(before_signal, dtype=np.float64)
     after_signal = np.asarray(after_signal, dtype=np.float64)
 
@@ -225,12 +228,20 @@ def run_file_mode(args, config, config_path):
     print(f"Reference:              {args.reference}")
     print(f"Clean (ground truth):  {args.clean if has_clean else 'NOT PROVIDED - metrics skipped'}")
     print(f"NLMS:                  {'ON' if args.nlms else 'OFF'}")
+    print(f"Engine:                {'ONNX (chunked)' if args.onnx else 'PyTorch DeepFilterNet3'}")
+    if args.onnx:
+        print(f"Chunk size:             {args.chunk_seconds}s")
     print()
-    print("Loading DeepFilterNet3 and running pipeline...")
+    print("Loading model and running pipeline...")
 
     start = time.perf_counter()
-    enhanced = enhance_audio_file(args.primary, args.reference, config_path=config_path,
-                                   use_nlms=args.nlms)
+    if args.onnx:
+        enhanced = enhance_audio_file_onnx(args.primary, args.reference, config_path=config_path,
+                                            onnx_dir=args.onnx_dir, chunk_seconds=args.chunk_seconds,
+                                            use_nlms=args.nlms)
+    else:
+        enhanced = enhance_audio_file(args.primary, args.reference, config_path=config_path,
+                                       use_nlms=args.nlms)
     elapsed = time.perf_counter() - start
 
     noisy_signal = load_audio_file(args.primary, config_path)
@@ -255,6 +266,7 @@ def run_file_mode(args, config, config_path):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     base = os.path.splitext(os.path.basename(args.primary))[0]
     suffix = "_nlms" if args.nlms else ""
+    suffix += "_onnx" if args.onnx else ""
 
     enhanced_path = os.path.join(OUTPUT_DIR, f"{base}_enhanced{suffix}.wav")
     sf.write(enhanced_path, enhanced, sample_rate)
@@ -281,6 +293,7 @@ def run_mic_mode(args, config, config_path):
     print("=" * 70)
     print("MIC MODE - single mic, silent reference (no physical second mic yet)")
     print(f"NLMS: {'ON (no-op with a silent reference)' if args.nlms else 'OFF'}")
+    print(f"Engine: {'ONNX (chunked)' if args.onnx else 'PyTorch DeepFilterNet3'}")
     print("No clean reference exists for live speech, so SNR/STOI/PESQ are")
     print("not shown here - only before/after audio and waveform.")
     print("=" * 70)
@@ -301,8 +314,12 @@ def run_mic_mode(args, config, config_path):
     sf.write(ref_path, reference_signal, sample_rate)
 
     print("Running model stage...")
-    dtln_output, _ = enhance_dtln_stage(raw_path, ref_path, config_path=config_path)
-    enhanced = apply_nlms(dtln_output, reference_signal) if args.nlms else dtln_output
+    if args.onnx:
+        model_output, _ = enhance_onnx_stage(raw_path, ref_path, config_path=config_path,
+                                              onnx_dir=args.onnx_dir, chunk_seconds=args.chunk_seconds)
+    else:
+        model_output, _ = enhance_dtln_stage(raw_path, ref_path, config_path=config_path)
+    enhanced = apply_nlms(model_output, reference_signal) if args.nlms else model_output
 
     enhanced_path = os.path.join(OUTPUT_DIR, "mic_enhanced.wav")
     sf.write(enhanced_path, enhanced, sample_rate)
@@ -334,6 +351,16 @@ if __name__ == "__main__":
     parser.add_argument("--nlms", action="store_true",
                          help="Run NLMS after the model stage. OFF by default - "
                               "see module docstring for why.")
+    parser.add_argument("--onnx", action="store_true",
+                         help="Use the ONNX chunked wrapper (src/df_onnx_dsp.py) instead "
+                              "of the torch DeepFilterNet3 path. This is the Pi-deployment "
+                              "engine - no Rust/torch dependency.")
+    parser.add_argument("--onnx-dir", default="models/onnx_export",
+                         help="Folder containing enc.onnx/erb_dec.onnx/df_dec.onnx "
+                              "(--onnx mode only).")
+    parser.add_argument("--chunk-seconds", type=float, default=2.0,
+                         help="Chunk size in seconds for --onnx mode. GRU state resets "
+                              "at each chunk boundary.")
     parser.add_argument("--primary", default=None,
                          help="Path to noisy primary-mic wav file (file mode).")
     parser.add_argument("--reference", default=None,
